@@ -1,0 +1,17 @@
+const assert=require('assert');const {borders,dragSequence}=require('../pane-views.js');
+const panes=[{x:0,y:1,width:59,height:38},{x:60,y:1,width:60,height:38}];assert.equal(borders(panes).length,1);assert.equal(borders(panes)[0].axis,'x');
+assert.equal(borders([{x:0,y:1,width:120,height:17},{x:0,y:20,width:120,height:19}])[0].axis,'y');
+const handlers={},frames=new Map();let next=0,held=false,sent=[],renders=0;
+global.requestAnimationFrame=fn=>{frames.set(++next,fn);return next};global.cancelAnimationFrame=id=>frames.delete(id);
+global.window={addEventListener(){}};global.document={createElement:()=>({style:{},dataset:{}})};
+const mount={append(){},getBoundingClientRect:()=>({left:0,top:0}),addEventListener(k,f){handlers[k]=f},setPointerCapture(){held=true},hasPointerCapture(){return held},releasePointerCapture(){held=false}};
+const view=Object.assign(Object.create(global.PaneViews.prototype),{mount,source:{cols:120,rows:40,element:{querySelector:()=>({getBoundingClientRect:()=>({left:0,top:0,width:1200,height:800})})}},layout:{supported:true,cols:120,rows:40,panes},send:s=>sent.push(s),render(){renders++}});
+view.installBorderDrag();
+const event=(x=595)=>({button:0,pointerId:1,clientX:x,clientY:200,preventDefault(){},stopImmediatePropagation(){}});
+handlers.pointerdown(event());assert(view.borderDrag);assert(held);assert(!view.resizeGuide.hidden);
+for(let i=0;i<120;i++)handlers.pointermove(event(675));
+assert.equal(sent.length,0);assert.equal(frames.size,1);assert(view.resizing);
+for(const fn of frames.values())fn();frames.clear();assert.equal(view.resizeGuide.style.left,'675px');
+handlers.pointerup(event(675));assert.equal(sent.length,1);assert.equal(sent[0],dragSequence(60,11,68,11));assert(!held);assert(view.resizeGuide.hidden);assert(!view.resizing);
+frames.clear();view.frame=0;handlers.pointerdown(event());handlers.pointermove(event(695));handlers.pointercancel();assert.equal(sent.length,1);assert(!view.borderDrag);
+console.log('PASS: 120 drag moves -> one preview frame, zero remote input while moving, one commit; pointer cancellation, horizontal/vertical borders');

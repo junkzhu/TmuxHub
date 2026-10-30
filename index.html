@@ -1,0 +1,187 @@
+<!DOCTYPE html><html lang="zh-CN"><meta charset="utf-8"><title>Tmux</title>
+<link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css">
+<link rel="stylesheet" href="appearance.css">
+<aside id="sidebar"><header><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/></svg></span> Tmux</header><button class="group" id="localgroup" aria-expanded="true">本机</button><div id="locals"></div><button class="group" id="remotegroup" aria-expanded="true">服务器</button><div id="servers"></div></aside>
+<div id="sidebar-resize" role="separator" aria-label="调整侧栏宽度" aria-orientation="vertical" tabindex="0" title="拖动调整侧栏宽度，双击恢复默认"></div><main><nav><button id="toggle" title="展开/收起侧栏" aria-label="展开/收起侧栏" aria-expanded="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button><div id="tabs" role="tablist" aria-label="终端标签"></div></nav><section id="area"><div id="welcome"><div class="welcome-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/></svg></div><div class="badge">TERMINAL WORKSPACE</div><h1>选择一个项目，<br>继续上次的工作。</h1><p>从左侧打开项目，或点击服务器旁的 ＋ 添加项目。</p></div></section><div id="bar">就绪</div></main><div class="context-menu" id="contextmenu" role="menu" aria-label="终端操作" hidden><button class="menu-item terminal-action" id="terminal-0" role="menuitem">新建终端窗口</button><button class="menu-item terminal-action" id="terminal-1" role="menuitem">向右新建终端</button><button class="menu-item terminal-action" id="terminal-2" role="menuitem">向左新建终端</button><button class="menu-item terminal-action" id="terminal-3" role="menuitem">向下新建终端</button><button class="menu-item terminal-action" id="terminal-4" role="menuitem">向上新建终端</button><div class="menu-divider" role="separator"></div><button class="menu-item" id="pane-font-up" role="menuitem">放大此分屏字号<kbd>Ctrl 滚轮↑</kbd></button><button class="menu-item" id="pane-font-down" role="menuitem">缩小此分屏字号<kbd>Ctrl 滚轮↓</kbd></button><div class="menu-divider" role="separator"></div><button class="menu-item" id="copy" role="menuitem">复制<kbd>Ctrl C</kbd></button><button class="menu-item" id="paste" role="menuitem">粘贴<kbd>Ctrl V</kbd></button><div class="menu-divider" role="separator"></div><button class="menu-item" id="selectall" role="menuitem">全选</button></div><div class="toast" id="toast" role="status" hidden></div>
+<script src="node_modules/@xterm/xterm/lib/xterm.js"></script><script src="node_modules/@xterm/addon-fit/lib/addon-fit.js"></script><script src="connection.js"></script><script src="pane-views.js"></script><script src="projects-ui.js"></script><script src="managed-workspace.js"></script><script>
+const FitAddon=window.FitAddon.FitAddon;
+const ipc=new TmuxConnection({token:location.hash.slice(1),socketURL:location.origin.replace(/^http/,'ws')+'/',resolveToken:async()=>{const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),5000);try{const response=await fetch('/api/connection',{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error('连接服务暂时不可用');const {token}=await response.json();if(typeof token!=='string'||!token)throw new Error('连接凭据不可用');history.replaceState(null,'','#'+token);return token}finally{clearTimeout(timer)}}});
+const Buffer={from(value,encoding){if(encoding==='base64')return Uint8Array.from(atob(value),c=>c.charCodeAt(0));const bytes=new TextEncoder().encode(value);return {toString(){return btoa(Array.from(bytes,b=>String.fromCharCode(b)).join(''))}}}};
+const sessions=new Map();let active=null;const $=id=>document.getElementById(id);
+const projectUI=new TmuxProjects({ipc,row,onOpen:connect,onReconnect:host=>{const opened=[...sessions].filter(([id,s])=>projectUI.get(id)?.host===host&&!s.hidden);if(!opened.length){connect(host);return}for(const [id]of opened)startSession(id,true)},onRender:()=>{
+ for(const [id,s]of sessions){s.tabSelect.textContent=projectUI.title(id);s.tab.querySelector('.tab-close').setAttribute('aria-label','关闭 '+projectUI.title(id)+' 标签');status(id,s.state==='ready'?(s.hidden?'后台运行':'终端已打开'):s.state==='ended'?'已断开':'连接中',s.state==='ready'?'#51856D':'#9A742F')}
+ document.querySelectorAll('.server').forEach(b=>b.classList.toggle('active',b.dataset.host===active));
+}});
+
+// Terminal zoom is independent of browser/page zoom.
+const FONT_SIZE_KEY='tmux-font-size-v1';
+function terminalFontSize(id){
+ try{const saved=Number(localStorage.getItem(FONT_SIZE_KEY+':'+id)??localStorage.getItem(FONT_SIZE_KEY));if(Number.isFinite(saved)&&saved>=10&&saved<=32)return Math.round(saved)}catch{}
+ return 16;
+}
+let fontWheelDelta=0,fontWheelTime=0,fontWheelSession=null;
+window.addEventListener('wheel',e=>{
+ if(!e.ctrlKey||!$('area').contains(e.target)||!sessions.has(active))return;
+ e.preventDefault();e.stopImmediatePropagation();
+ const now=performance.now();const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?120:1);
+ if(!Number.isFinite(delta)||delta===0)return;
+ const wheelPane=e.target.closest('.pane-view')?.dataset.pane||'';const wheelKey=active+':'+wheelPane;
+ if(fontWheelSession!==wheelKey||now-fontWheelTime>250||Math.sign(delta)!==Math.sign(fontWheelDelta))fontWheelDelta=0;
+ fontWheelSession=wheelKey;fontWheelTime=now;fontWheelDelta+=delta;
+ if(Math.abs(fontWheelDelta)>=40){if(!sessions.get(active).views?.zoom(e.target,fontWheelDelta<0?1:-1))notify('请将鼠标移到分屏内容区域；连接后稍候即可调整');fontWheelDelta=0}
+},{capture:true,passive:false});
+
+ipc.on('pane-layout',(_,id,layout)=>{const s=sessions.get(id);if(!s)return;s.views?.update(layout);clearTimeout(s.paneWatchTimer);if(!layout&&s.attached&&s.paneTty){const epoch=s.attachEpoch;s.paneWatchTimer=setTimeout(()=>{if(s.attached&&s.attachEpoch===epoch&&ipc.online)ipc.send('pane-watch',id,s.paneTty)},5000)}});
+function inputTerminal(s){return s.views?.inputTerm()||s.term}
+function status(id,text,color){const b=document.querySelector('[data-host="'+id+'"]');if(b){b.dataset.state=['连接中','正在恢复','等待重连'].includes(text)?'busy':(text==='终端已打开'||text==='后台运行')?'open':(text==='失败'||text==='已断开')?'error':'idle';b.querySelector('small').textContent=text;b.querySelector('.dot').style.background=color;const reload=b.querySelector('.server-refresh');if(reload)reload.disabled=text==='连接中';b.querySelector('.server-open').setAttribute('aria-label',projectUI.title(id)+' · '+text);if(active===id){$('bar').textContent=projectUI.title(id)+' · '+text;$('bar').dataset.state=b.dataset.state;}}}
+function select(id){const selected=sessions.get(id);selected.hidden=false;selected.tab.hidden=false;active=id;$('welcome').style.display='none';for(const [k,s]of sessions){s.el.classList.toggle('active',k===id);s.tab.classList.toggle('active',k===id);s.tabSelect.setAttribute('aria-selected',String(k===id))}document.querySelectorAll('.server').forEach(b=>b.classList.toggle('active',b.dataset.host===id));const s=sessions.get(id);const row=document.querySelector('[data-host="'+id+'"]');if(row){$('bar').textContent=projectUI.title(id)+' · '+row.querySelector('small').textContent;$('bar').dataset.state=row.dataset.state||'idle'}if(s.state==='ready')status(id,'终端已打开','#51856D');requestAnimationFrame(()=>{s.fit.fit();inputTerminal(s).focus()});saveWorkspace();}
+function closeTab(id){const s=sessions.get(id);if(!s)return;hideMenu();s.hidden=true;s.tab.hidden=true;s.el.classList.remove('active');s.tab.classList.remove('active');s.tabSelect.setAttribute('aria-selected','false');
+if(s.state==='ready')status(id,'后台运行','#51856D');
+if(active===id){const visible=Array.from($('tabs').children).filter(tab=>!tab.hidden).map(tab=>[tab.dataset.session,sessions.get(tab.dataset.session)]);if(visible.length){select(visible[visible.length-1][0]);}else{active=null;$('welcome').style.display='';$('bar').textContent='就绪';$('bar').dataset.state='idle';document.querySelectorAll('.server').forEach(row=>row.classList.remove('active'));$('toggle').focus();}}saveWorkspace();}
+function connect(id){if(!projectUI.get(id))return;if(sessions.has(id)){const s=sessions.get(id);select(id);if(s.ended||s.state==='waiting')startSession(id,true);else ipc.wake();return}
+const el=document.createElement('div');el.className='term';const mount=document.createElement('div');mount.className='terminal-mount';el.append(mount);$('area').append(el);
+const tab=document.createElement('div');tab.className='tab';tab.setAttribute('role','presentation');tab.dataset.session=id;
+const tabSelect=document.createElement('button');tabSelect.className='tab-select';tabSelect.setAttribute('role','tab');tabSelect.textContent=projectUI.title(id);tabSelect.onclick=()=>select(id);
+const tabClose=document.createElement('button');tabClose.className='tab-close';tabClose.title='关闭标签，保留后台会话';tabClose.setAttribute('aria-label','关闭 '+projectUI.title(id)+' 标签');tabClose.innerHTML='<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="m4 4 8 8M12 4l-8 8"/></svg>';tabClose.onclick=e=>{e.stopPropagation();closeTab(id)};
+tab.append(tabSelect,tabClose);$('tabs').append(tab);restoreTabOrder();enableTabDrag(tab,tabSelect,id);
+
+const options={fontFamily:'"Cascadia Mono",Consolas,"Microsoft YaHei UI","Microsoft YaHei",monospace',fontSize:terminalFontSize(id),lineHeight:1.22,letterSpacing:0,fontWeight:400,fontWeightBold:700,drawBoldTextInBrightColors:false,minimumContrastRatio:4.5,cursorBlink:true,cursorStyle:'bar',cursorWidth:2,disableStdin:true,allowTransparency:true,theme:{background:'#ffffff00',foreground:'#303740',cursor:'#4277B5',cursorAccent:'#FFFFFF',selectionBackground:'#B9CDE780',selectionInactiveBackground:'#C7D1DC70',black:'#303740',red:'#A44742',green:'#3F7255',yellow:'#89671F',blue:'#3E659D',magenta:'#78559D',cyan:'#317482',white:'#636D78',brightBlack:'#697581',brightRed:'#A94A44',brightGreen:'#48795C',brightYellow:'#8A6825',brightBlue:'#416DAA',brightMagenta:'#805DA5',brightCyan:'#347988',brightWhite:'#515D68'},scrollback:8000};
+const s={el,tab,tabSelect,hidden:false,ended:false,state:'connecting',attached:false,wantsConnection:true,retryAttempts:0};sessions.set(id,s);
+s.views=new ManagedWorkspace({id,mount,ipc,options,notify,onState:state=>{
+ s.state=state;s.attached=state==='ready';s.ended=false;
+ if(state==='ended'){s.ended=true;s.wantsConnection=false;status(id,'已退出','#909BA5');closeTab(id);return}
+ if(state==='ready'){s.attachEpoch=(s.attachEpoch||0)+1;status(id,s.hidden?'后台运行':'终端已打开','#51856D')}
+ else status(id,state==='error'?'失败':'连接中',state==='error'?'#B4594E':'#9A742F');
+}});
+Object.defineProperty(s,'term',{get:()=>s.views.inputTerm()});s.fit={fit:()=>s.views.fitAll()};
+select(id);startSession(id);}
+
+function clearSessionTimers(s){clearTimeout(s.retryTimer);clearTimeout(s.stableTimer);s.retryTimer=null;s.retryAt=0;}
+function startSession(id,reconnect=false){const s=sessions.get(id);if(!s)return;clearSessionTimers(s);s.ended=false;s.wantsConnection=true;s.attached=false;if(!ipc.online){s.state='recovering';status(id,'正在恢复','#9A742F');ipc.wake();return}s.views.open(reconnect);}
+
+function retrySession(id){const s=sessions.get(id);if(!s||!s.wantsConnection)return;clearSessionTimers(s);s.attached=false;s.term.options.disableStdin=true;s.state=ipc.online?'waiting':'recovering';status(id,ipc.online?'等待重连':'正在恢复','#9A742F');if(!ipc.online)return;const delay=Math.min(30000,1000*2**Math.min(s.retryAttempts++,5));s.retryAt=Date.now()+delay;s.retryTimer=setTimeout(()=>startSession(id),delay);}
+ipc.on('output',(_,id,data,streamId)=>{const s=sessions.get(id);if(!s)return;const bytes=Buffer.from(data,'base64');try{s.term.write(bytes,()=>{if(streamId)ipc.send('output-ack',id,streamId,bytes.length)})}catch{startSession(id,true);return}if(s.attached){s.state='ready';status(id,s.hidden?'后台运行':'终端已打开','#51856D')}});
+ipc.on('ended',(_,id,details={})=>{const s=sessions.get(id);if(!s)return;s.attached=false;s.term.options.disableStdin=true;clearSessionTimers(s);if(details.retryable){retrySession(id);return}s.ended=true;s.wantsConnection=false;s.state='ended';s.term.write('\r\n连接已结束，点击左侧服务器可重连。\r\n');status(id,'已断开','#B4594E')});
+ipc.on('failure',(_,id,msg)=>{const s=sessions.get(id);if(s)s.tab.title=msg;status(id,'失败','#B4594E')});
+function row(host,label){const b=document.createElement('div');b.className='server';b.dataset.host=host;
+const open=document.createElement('button');open.className='server-open';open.title='连接 '+label;
+const arrow=document.createElement('span');arrow.className='arrow';arrow.textContent='›';
+const dot=document.createElement('span');dot.className='dot';
+const text=document.createElement('span');text.className='server-name';text.textContent=label;
+const small=document.createElement('small');small.textContent='未连接';
+open.append(arrow,dot,text,small);open.onclick=()=>connect(host);b.append(open);
+const reload=document.createElement('button');reload.className='server-refresh';reload.title='重新连接 '+label;reload.setAttribute('aria-label','重新连接 '+label);reload.innerHTML='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5"/><path d="M19.2 11a7.3 7.3 0 1 0-1.8 6.2"/></svg>';reload.onclick=()=>{if(!sessions.has(host)){connect(host);return}select(host);startSession(host,true);};b.append(reload);return b;}
+ipc.on('started',(_,id)=>{const s=sessions.get(id);if(s){clearTimeout(s.paneWatchTimer);s.paneTty=null;s.views?.reset();s.ended=false;s.attached=true;s.attachEpoch=(s.attachEpoch||0)+1;s.state='connecting';if(s.hasStarted)s.term.reset();s.hasStarted=true;s.term.options.disableStdin=false;status(id,'连接中','#9A742F');s.fit.fit();ipc.send('resize',id,s.term.cols,s.term.rows);clearTimeout(s.stableTimer);s.stableTimer=setTimeout(()=>{if(s.attached)s.retryAttempts=0},30000)}});
+
+async function refresh(){await projectUI.refresh()}
+for(const [group,container,title]of [['localgroup','locals','本机'],['remotegroup','servers','服务器']])$(group).onclick=()=>{const hide=$(container).hidden=!$(container).hidden;$(group).setAttribute('aria-expanded',String(!hide))};$('toggle').onclick=()=>{$('sidebar').classList.toggle('hidden');$('toggle').setAttribute('aria-expanded',String(!$('sidebar').classList.contains('hidden')));setTimeout(()=>sessions.get(active)?.fit.fit(),30);saveWorkspace()};window.addEventListener('resize',scheduleTerminalResize);
+
+let toastTimer;function notify(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,3500)}
+function hideMenu(){$('contextmenu').hidden=true}
+$('area').addEventListener('contextmenu',e=>{if(!sessions.has(active))return;e.preventDefault();const menu=$('contextmenu');menu.hidden=false;document.querySelectorAll('.terminal-action').forEach(b=>b.disabled=!ipc.online||!sessions.get(active).attached);for(const name of ['pane-font-up','pane-font-down'])$(name).disabled=!sessions.get(active).views?.selected; $('copy').disabled=!inputTerminal(sessions.get(active)).hasSelection();menu.style.left=Math.max(8,Math.min(e.clientX,innerWidth-menu.offsetWidth-8))+'px';menu.style.top=Math.max(8,Math.min(e.clientY,innerHeight-menu.offsetHeight-8))+'px';$('copy').disabled?$('paste').focus():$('copy').focus()});
+document.addEventListener('pointerdown',e=>{if(!$('contextmenu').contains(e.target))hideMenu()},true);document.addEventListener('keydown',e=>{if(e.key==='Escape'){hideMenu();sessions.has(active)&&inputTerminal(sessions.get(active)).focus()}});window.addEventListener('resize',hideMenu);
+$('contextmenu').addEventListener('keydown',e=>{if(!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;e.preventDefault();const buttons=Array.from($('contextmenu').querySelectorAll('button:not(:disabled)'));let i=buttons.indexOf(document.activeElement);i=e.key==='Home'?0:e.key==='End'?buttons.length-1:(i+(e.key==='ArrowDown'?1:-1)+buttons.length)%buttons.length;buttons[i]?.focus()});
+for(const [name,delta]of [['pane-font-up',1],['pane-font-down',-1]])$(name).onclick=()=>{const views=sessions.get(active)?.views;const view=views?.views.get(views.selected);hideMenu();if(view)views.zoom(view.el,delta)};
+$('copy').onclick=()=>copyTerminal();
+$('paste').onclick=()=>pasteTerminal();
+for(let i=0;i<5;i++)$('terminal-'+i).onclick=()=>{const s=sessions.get(active);hideMenu();if(!s?.attached||!ipc.online){notify('连接正在恢复，请稍后重试');return}s.views.action(i);inputTerminal(s).focus()};
+$('selectall').onclick=()=>{const s=sessions.get(active);hideMenu();inputTerminal(s).selectAll();inputTerminal(s).focus()};
+
+const clipboardRequests=new Map();let clipboardSeq=0;
+ipc.on('clipboard-result',(_,id,ok,value)=>{const r=clipboardRequests.get(id);if(!r)return;clearTimeout(r.timer);clipboardRequests.delete(id);ok?r.resolve(value):r.reject(new Error(value))});
+function clipboardRequest(action,text){return new Promise((resolve,reject)=>{const id='clip-'+Date.now()+'-'+(++clipboardSeq);const timer=setTimeout(()=>{clipboardRequests.delete(id);reject(new Error('剪贴板响应超时'))},10000);clipboardRequests.set(id,{resolve,reject,timer});if(!ipc.send(action,id,text)){clearTimeout(timer);clipboardRequests.delete(id);reject(new Error('连接正在恢复'))}})}
+async function copyTerminal(){const s=sessions.get(active);hideMenu();if(!s)return;const text=inputTerminal(s).getSelection()||window.getSelection()?.toString();if(!text){notify('请用鼠标拖选文字，再按 Ctrl+C。');inputTerminal(s).focus();return}try{await clipboardRequest('clipboard-write',text);notify('已复制')}catch(e){try{await navigator.clipboard.writeText(text);notify('已复制')}catch{notify(e.message)}}inputTerminal(s).focus()}
+async function pasteTerminal(){const s=sessions.get(active);hideMenu();if(!s)return;const targetTerm=inputTerminal(s),generation=ipc.generation,epoch=s.attachEpoch;const ready=()=>ipc.online&&s.attached&&ipc.generation===generation&&s.attachEpoch===epoch&&inputTerminal(s)===targetTerm;if(!ready()){notify('连接正在恢复，请稍后粘贴');return}try{const text=await clipboardRequest('clipboard-read');if(text&&ready())targetTerm.paste(text)}catch(e){if(!ready())return;try{const text=await navigator.clipboard.readText();if(text&&ready())targetTerm.paste(text)}catch{notify(e.message)}}inputTerminal(s).focus()}
+function terminalClipboardShortcut(e){
+ const s=sessions.get(active);
+ if(!s||!e.ctrlKey||e.altKey||e.metaKey||e.isComposing||!e.target?.closest?.('.term.active'))return;
+ const key=(e.key||'').toLowerCase(),copy=e.code==='KeyC'||key==='c',paste=e.code==='KeyV'||key==='v';
+ if(!copy&&!paste)return;
+ // Preserve Ctrl+C as SIGINT when there is no selected terminal text.
+ if(copy&&!e.shiftKey&&!inputTerminal(s).hasSelection())return;
+ e.preventDefault();e.stopImmediatePropagation();
+ if(!e.repeat)(copy?copyTerminal():pasteTerminal());
+}
+document.addEventListener('keydown',terminalClipboardShortcut,true);
+// Browser/app menus can dispatch copy directly without a DOM keydown.
+document.addEventListener('copy',e=>{
+ const s=sessions.get(active);if(!s||!inputTerminal(s).hasSelection()||!(s.el.contains(document.activeElement)||s.el.contains(e.target)))return;
+ e.preventDefault();e.stopImmediatePropagation();e.clipboardData?.setData('text/plain',inputTerminal(s).getSelection());copyTerminal();
+},true);
+
+const TAB_ORDER_KEY='tmux-tab-order-v1';let tabDrag=null,suppressDragClick=false;
+function savedTabOrder(){try{const value=JSON.parse(localStorage.getItem(TAB_ORDER_KEY)||'[]');return Array.isArray(value)?value.filter(x=>typeof x==='string'):[]}catch{return []}}
+function persistTabOrder(){try{localStorage.setItem(TAB_ORDER_KEY,JSON.stringify(Array.from($('tabs').children).map(tab=>tab.dataset.session)))}catch{}saveWorkspace()}
+function restoreTabOrder(){const order=savedTabOrder();const nodes=Array.from($('tabs').children);const originalRank=new Map(nodes.map((tab,index)=>[tab,index]));const rank=tab=>{const n=order.indexOf(tab.dataset.session);return n<0?order.length+originalRank.get(tab):n};nodes.sort((a,b)=>rank(a)-rank(b)).forEach(tab=>$('tabs').append(tab))}
+function enableTabDrag(tab,button,id){button.title='拖动调整顺序';button.addEventListener('pointerdown',e=>{if(e.button!==0||tabDrag)return;tabDrag={tab,id,pointer:e.pointerId,x:e.clientX,y:e.clientY,moved:false}});
+button.addEventListener('keydown',e=>{if(!e.altKey||!e.shiftKey||!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();const visible=Array.from($('tabs').children).filter(t=>!t.hidden);const index=visible.indexOf(tab),other=visible[index+(e.key==='ArrowLeft'?-1:1)];if(!other)return;$('tabs').insertBefore(tab,e.key==='ArrowLeft'?other:other.nextSibling);persistTabOrder();button.focus()});}
+document.addEventListener('pointermove',e=>{const d=tabDrag;if(!d||d.pointer!==e.pointerId)return;if(!d.moved&&Math.hypot(e.clientX-d.x,e.clientY-d.y)<5)return;e.preventDefault();if(!d.moved){d.moved=true;d.tab.classList.add('dragging');$('tabs').classList.add('reordering');$('tabs').setPointerCapture(e.pointerId)}const container=$('tabs');const box=container.getBoundingClientRect();if(e.clientX<box.left+24)container.scrollLeft-=18;else if(e.clientX>box.right-24)container.scrollLeft+=18;
+const siblings=Array.from(container.children).filter(t=>t!==d.tab&&!t.hidden);let before=null;for(const other of siblings){const r=other.getBoundingClientRect();if(e.clientX<r.left+r.width/2){before=other;break}}if(before!==d.tab.nextSibling)container.insertBefore(d.tab,before);});
+function finishTabDrag(cancel=false){const d=tabDrag;if(!d)return;tabDrag=null;d.tab.classList.remove('dragging');$('tabs').classList.remove('reordering');if($('tabs').hasPointerCapture(d.pointer))$('tabs').releasePointerCapture(d.pointer);if(d.moved){suppressDragClick=true;setTimeout(()=>suppressDragClick=false,0);persistTabOrder();if(!cancel)d.tab.querySelector('.tab-select').focus()}}
+document.addEventListener('pointerup',()=>finishTabDrag());document.addEventListener('pointercancel',()=>finishTabDrag(true));window.addEventListener('blur',()=>finishTabDrag(true));document.addEventListener('click',e=>{if(suppressDragClick){e.preventDefault();e.stopImmediatePropagation();suppressDragClick=false}},true);
+
+const WORKSPACE_KEY='tmux-workspace-v1';let restoringWorkspace=true;
+function loadWorkspace(){try{const state=JSON.parse(localStorage.getItem(WORKSPACE_KEY)||'null');return state&&Array.isArray(state.tabs)?state:null}catch{return null}}
+function saveWorkspace(){if(restoringWorkspace)return;const tabs=Array.from($('tabs').children).filter(tab=>!tab.hidden).map(tab=>tab.dataset.session);const state={tabs,active:tabs.includes(active)?active:tabs[0]||null,sidebarCollapsed:$('sidebar').classList.contains('hidden')};try{localStorage.setItem(WORKSPACE_KEY,JSON.stringify(state));localStorage.setItem(TAB_ORDER_KEY,JSON.stringify(Array.from($('tabs').children).map(tab=>tab.dataset.session)))}catch{}}
+function restoreWorkspace(){const state=loadWorkspace();try{if(!state)return;const allowed=new Set([...projectUI.items.values()].filter(p=>!p.host.toLowerCase().endsWith('-gateway')).map(p=>p.id));const tabs=Array.from(new Set(state.tabs)).filter(id=>typeof id==='string'&&allowed.has(id));
+if(state.sidebarCollapsed){$('sidebar').classList.add('hidden');$('toggle').setAttribute('aria-expanded','false')}
+for(const id of tabs)connect(id);
+// Preserve the exact visible order even if other, previously closed tabs had a stored rank.
+for(const id of tabs){const item=sessions.get(id);if(item)$('tabs').append(item.tab)}
+if(tabs.length)select(tabs.includes(state.active)?state.active:tabs[0]);
+}finally{restoringWorkspace=false;saveWorkspace()}}
+let workspaceReady=false,restoreAttempt=0;
+ipc.on('transport',(_,state)=>{
+ if(state==='online'){
+  for(const [id,s]of sessions)if(s.wantsConnection&&!s.ended)startSession(id);
+  if(!workspaceReady){const attempt=++restoreAttempt;refresh().then(()=>{if(attempt!==restoreAttempt||!ipc.online)return;workspaceReady=true;restoreWorkspace();if(!active){$('bar').textContent='就绪';$('bar').dataset.state='idle'}}).catch(()=>{if(attempt===restoreAttempt&&ipc.online)ipc.disconnect()});}
+ }else{
+  ++restoreAttempt;
+  for(const [id,s]of sessions){if(!s.wantsConnection||s.ended)continue;clearSessionTimers(s);s.attached=false;s.term.options.disableStdin=true;s.state='recovering';status(id,'正在恢复','#9A742F');}
+  for(const r of clipboardRequests.values()){clearTimeout(r.timer);r.reject(new Error('连接正在恢复'))}clipboardRequests.clear();
+  if(!active){$('bar').textContent='正在恢复连接…';$('bar').dataset.state='busy'}
+ }
+});
+function wakeConnections(){ipc.wake();for(const [id,s]of sessions)if(s.state==='waiting'&&s.retryAt&&Date.now()>=s.retryAt)startSession(id);const s=sessions.get(active);if(s){s.fit.fit();s.term.refresh(0,s.term.rows-1)}}
+window.addEventListener('pagehide',()=>{saveWorkspace();ipc.stop()});window.addEventListener('pageshow',()=>{ipc.start();wakeConnections()});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')saveWorkspace();else wakeConnections()});window.addEventListener('focus',wakeConnections);window.addEventListener('online',wakeConnections);
+
+const SIDEBAR_WIDTH_KEY='tmux-sidebar-width-v1';
+let sidebarDrag=null;
+// Resize the remote PTY only after dragging settles. Repeated intermediate
+// SIGWINCH events force full-screen remote applications to repaint over SSH.
+let terminalResizeTimer=0;
+const resizingViews=new Set();
+function scheduleTerminalResize(){
+ const s=sessions.get(active);
+ if(s?.views){s.views.pauseResize();resizingViews.add(s.views)}
+ clearTimeout(terminalResizeTimer);
+ terminalResizeTimer=setTimeout(()=>{
+  terminalResizeTimer=0;
+  const current=sessions.get(active);
+  try{current?.fit.fit()}finally{
+   for(const views of resizingViews)views.resumeResize();
+   resizingViews.clear();
+  }
+ },160);
+}
+function sidebarBounds(){return {min:160,max:Math.max(160,Math.min(480,innerWidth-280))}}
+function setSidebarWidth(width,persist=false){
+ const {min,max}=sidebarBounds();width=Math.round(Math.max(min,Math.min(max,width)));
+ $('sidebar').style.setProperty('--sidebar-width',width+'px');
+ const handle=$('sidebar-resize');handle.setAttribute('aria-valuemin',String(min));handle.setAttribute('aria-valuemax',String(max));handle.setAttribute('aria-valuenow',String(width));
+ scheduleTerminalResize();
+ if(persist)try{localStorage.setItem(SIDEBAR_WIDTH_KEY,String(width))}catch{}
+}
+try{const saved=Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));if(saved>0)setSidebarWidth(saved)}catch{}
+$('sidebar-resize').addEventListener('pointerdown',e=>{if(e.button!==0)return;e.preventDefault();sidebarDrag={id:e.pointerId,x:e.clientX,width:$('sidebar').getBoundingClientRect().width};$('sidebar-resize').setPointerCapture(e.pointerId);document.body.classList.add('resizing-sidebar')});
+$('sidebar-resize').addEventListener('pointermove',e=>{if(sidebarDrag?.id===e.pointerId)setSidebarWidth(sidebarDrag.width+e.clientX-sidebarDrag.x)});
+function finishSidebarResize(){if(!sidebarDrag)return;const id=sidebarDrag.id;sidebarDrag=null;document.body.classList.remove('resizing-sidebar');if($('sidebar-resize').hasPointerCapture(id))$('sidebar-resize').releasePointerCapture(id);setSidebarWidth($('sidebar').getBoundingClientRect().width,true)}
+for(const event of ['pointerup','pointercancel','lostpointercapture'])$('sidebar-resize').addEventListener(event,finishSidebarResize);
+window.addEventListener('blur',finishSidebarResize);
+$('sidebar-resize').addEventListener('dblclick',()=>setSidebarWidth(innerWidth<=680?176:248,true));
+$('sidebar-resize').addEventListener('keydown',e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const {min,max}=sidebarBounds();setSidebarWidth(e.key==='Home'?min:e.key==='End'?max:$('sidebar').getBoundingClientRect().width+(e.key==='ArrowLeft'?-16:16),true)});
+window.addEventListener('resize',()=>{if(!$('sidebar').classList.contains('hidden'))setSidebarWidth($('sidebar').getBoundingClientRect().width)});
+
+ipc.start();
+</script></html>

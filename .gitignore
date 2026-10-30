@@ -1,0 +1,17 @@
+node_modules/
+projects.json
+projects.json.*
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+!.env.example
+*.bak
+*.before-*
+preview*.png
+.ssh/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
